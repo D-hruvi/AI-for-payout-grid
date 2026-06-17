@@ -3,7 +3,7 @@ Digit 2W Insurance Commission Grid Processor — AI Edition
 ============================================================
 Instead of hardcoded Python field-mapping logic, this version sends raw
 grid rows (from the source commission Excel) to an LLM (Groq /
-llama-3.3-70b-versatile, free tier) in small batches. The LLM is given
+llama-3.1-8b-instant, free tier) in small batches. The LLM is given
 the full 27 business rules as a system prompt and returns the final
 structured "rule engine" output rows directly as JSON.
 
@@ -38,7 +38,7 @@ except ImportError:
 # Config
 # ──────────────────────────────────────────────────────────────
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "llama-3.1-8b-instant"
 BATCH_SIZE = 8          # rows per LLM call — small batches = more reliable JSON
 MAX_RETRIES = 3
 RETRY_DELAY_SEC = 2
@@ -229,7 +229,7 @@ def call_llm_batch(client, sheet_name, batch_rows, rto_reference,
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0,
-                max_tokens=8000,
+                max_tokens=1500,
             )
             raw = resp.choices[0].message.content
             cleaned = _strip_json_fences(raw)
