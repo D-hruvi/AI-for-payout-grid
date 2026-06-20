@@ -177,9 +177,19 @@ BATCH_SIZE_BY_SHEET = {
 
 DEFAULT_BATCH_SIZE = 4
 
-TOKENS_PER_OUTPUT_ROW = 500   # rough per-row JSON budget, with headroom
+# Raised from 500 -> 650: the observed truncation failures (Bihar TW 1+5,
+# TW 1+1 & SATP, SAOD) were all "Unterminated string" / "Expecting property
+# name" JSON errors, the signature of the response getting cut off mid-row
+# by max_tokens rather than the model writing genuinely malformed JSON. 500
+# tokens/row was too tight once the long "EXCLUDE: BRAND1, BRAND2, ..." make
+# strings and multi-fuel strings (rule 12) are included in a row.
+TOKENS_PER_OUTPUT_ROW = 650
 MIN_MAX_TOKENS = 600
-MAX_TOKENS_CEILING = int(os.environ.get("GROQ_MAX_TOKENS_CEILING", "3500"))
+# Raised default ceiling 3500 -> 4096: llama-3.1-8b-instant on Groq supports
+# up to 8192 output tokens; 3500 was clipping the larger SAOD batches (4
+# output rows per input row) before they finished. Still override-able via
+# env var if a given account's TPM cap needs it lower.
+MAX_TOKENS_CEILING = int(os.environ.get("GROQ_MAX_TOKENS_CEILING", "4096"))
 
 MAX_RETRIES = 4
 RETRY_DELAY_SEC = 2
@@ -259,18 +269,19 @@ combination implied by the segment description) following these exact rules:
 10. RTO column: use the actual RTO codes mapped to this cluster from the "2W RTO's" sheet
     (comma-separated), or "ALL" only if the cluster has no specific RTO subset (covers the
     whole state).
-11. Vehicle Type column (Bike / Scooter / ALL): derived from the segment description in the
-    "2W RTO's" sheet's Agency/PB segment column.
-12. Fuel Type column: derived from "2W RTOs" Agency/PB segment column. Petrol can NEVER be
+11. Vehicle Type column (Bike / Scooter / ALL): derived from the segment description that is
+    already present on the raw row you were given (the "Agency/PB Seg" / "Segment" field of
+    THIS row) — not a separate lookup.
+12. Fuel Type column: derived from that same segment field on the raw row. Petrol can NEVER be
     output alone — it must always appear combined with other fuels, e.g.
     "Petrol, LPG, Diesel, CNG" (or the cluster-specific ordering if given), unless the segment
     is explicitly Electric-only (output "Electric") or explicitly "ALL".
-13. Make column: taken from the "2W RTOs" sheet's "Make" column. If the segment says
-    "Others"/excludes specific brands, output as "EXCLUDE: BRAND1, BRAND2, ..." using the
-    brand names given.
+13. Make column: taken directly from the "Make" field already present on the raw row you were
+    given (not a lookup). If the row's segment says "Others"/excludes specific brands, output
+    as "EXCLUDE: BRAND1, BRAND2, ..." using the brand names given on that row.
 14. Model column: "ALL" for almost every row. Only for TW 1+1 & SATP and SAOD sheets are
-    specific models sometimes excluded or included — use the "2W Grid 5+5" sheet reference
-    if such an exception is given in the batch context, otherwise default to "ALL".
+    specific models sometimes excluded or included — only apply an exception if the raw row
+    itself states one, otherwise default to "ALL".
 15. Owner Type column: always "ALL".
 16. Usage Type column: always blank (null).
 17. Booking Mode column: always "any".
@@ -278,19 +289,28 @@ combination implied by the segment description) following these exact rules:
 19. Covers column: always blank (null).
 20. Addon Selection Type column: always "na".
 21. Addons column: always blank (null).
-22. CC From / CC To columns: taken from the "2W Grid 5+5" sheet's Agency/PB segment CC bands,
-    if the segment implies a CC range. Otherwise blank (null).
-23. Power From / Power To columns: taken from the "2W Grid 5+5" sheet, if the segment implies
-    an EV power band (e.g. 3-7 KW -> Power From=3.00, Power To=7.00). Otherwise blank (null).
+22. CC From / CC To columns: derived from the segment field already present on the raw row
+    (e.g. "MC <=155" -> CC To=155; "3-7 KW" is a POWER band, not CC — see rule 23), if the
+    segment implies a CC range. Otherwise blank (null).
+23. Power From / Power To columns: derived from the segment field already present on the raw
+    row, if the segment implies an EV power band (e.g. "3-7 KW" -> Power From=3.00,
+    Power To=7.00). Otherwise blank (null).
 24. Any column not explicitly covered by a rule that is empty in the source/given output stays
     blank (null). NCB Type is always "na".
 25. PayIn (Commission Type) is always "net" UNLESS the source cell says "MISP", in which case
     Commission Type = "od" and Amount Percentage = "22.5".
 26. PayIn (Reward Type) is always "percentage".
-27. PayIn (Amount Percentage) is taken from the source grid's "Max CD2" column for the segment.
-    If the source cell says "MISP", the amount is 22.5. If the source cell says "D", the
-    amount is 0. Otherwise use the numeric value given (already a percentage, e.g. 35 means
-    35%, not 0.35).
+27. PayIn (Amount Percentage) is taken from the raw row's commission field for the relevant
+    output row:
+    - TW 1+5: use the row's "max_cd2" field.
+    - TW 1+1 & SATP: use "max_cd2_1plus1_od" for the Comprehensive/renew-rollover (OD) output
+      row, and "max_cd2_satp_tp" for the TP output row.
+    - TW SAOD with Flexi Options: use "max_cd2_year1"/"max_cd2_year2"/"max_cd2_year3"/
+      "max_cd2_year4" for the matching Vehicle Age (1/2/3/4) output row.
+    If that field's value is the string "MISP", the amount is 22.5 (and Commission Type = "od"
+    per rule 25). If the value is the string "D", the amount is 0. Otherwise use the numeric
+    value given directly as a percentage (e.g. 0.35 in the source means the percentage value is
+    35, since these source columns are stored as decimals — multiply by 100, e.g. 0.225 -> 22.5).
 
 Additional fixed output rules (not in the numbered list but always true):
 - PayIn (OD Amount) and PayIn (TP Amount) are always "0".
@@ -352,6 +372,35 @@ def _strip_json_fences(text):
     return text
 
 
+def _repair_truncated_json_array(text):
+    """Best-effort recovery for a JSON array that got cut off mid-object by
+    max_tokens (the "Unterminated string..." / "Expecting property name..."
+    errors seen in production). Rather than discarding an entire batch
+    because the LAST row in it got cut off, walk backward from the parse
+    error to the last complete '},' boundary, close the array there, and
+    parse THAT. Returns a list of row dicts (possibly missing the last 1-2
+    rows of the batch) or raises if nothing usable can be salvaged.
+
+    This only ever throws away a row that was already incomplete/unusable —
+    it never invents or alters data, it just stops being all-or-nothing
+    about a single dropped row at the end of a batch.
+    """
+    last_obj_end = text.rfind("},")
+    if last_obj_end == -1:
+        # Maybe it's a single complete object with nothing after — try the
+        # last '}' that isn't the very end (which already failed to parse).
+        last_obj_end = text.rfind("}")
+        if last_obj_end == -1:
+            raise ValueError("no complete JSON object found to salvage")
+        candidate = text[: last_obj_end + 1] + "]"
+    else:
+        candidate = text[: last_obj_end + 1] + "]"
+    parsed = json.loads(candidate)
+    if not isinstance(parsed, list) or not parsed:
+        raise ValueError("salvaged JSON was not a usable non-empty array")
+    return parsed
+
+
 def call_llm_batch(client, sheet_name, batch_rows, rto_reference,
                     state_filter, eff_start, eff_end, naming_context):
     """
@@ -359,6 +408,8 @@ def call_llm_batch(client, sheet_name, batch_rows, rto_reference,
     Retries on transient errors / malformed JSON, with backoff that's aware
     of *why* the call failed (rate limit vs. truncated output vs. other).
     """
+    labeled_rows = label_batch_rows(sheet_name, batch_rows)
+
     user_payload = {
         "sheet": sheet_name,
         "state_filter": state_filter,
@@ -366,7 +417,7 @@ def call_llm_batch(client, sheet_name, batch_rows, rto_reference,
         "effect_end_date": eff_end,
         "naming_instructions": naming_context,
         "rto_reference_for_this_state": rto_reference,
-        "rows": batch_rows,
+        "rows": labeled_rows,
     }
 
     user_msg = (
@@ -376,7 +427,7 @@ def call_llm_batch(client, sheet_name, batch_rows, rto_reference,
         f"Naming pattern to follow for rule_name: {naming_context}\n\n"
         f"RTO reference for this state (cluster -> rto codes): "
         f"{json.dumps(rto_reference)}\n\n"
-        f"Raw rows (JSON):\n{json.dumps(batch_rows, default=str)}\n\n"
+        f"Raw rows, each as a labeled object (JSON):\n{json.dumps(labeled_rows, default=str)}\n\n"
         f"Return the JSON array of output rows now."
     )
 
@@ -418,7 +469,26 @@ def call_llm_batch(client, sheet_name, batch_rows, rto_reference,
             print("\n========== RAW LLM RESPONSE ==========")
             print(cleaned)
             print("=====================================\n")
-            parsed = json.loads(cleaned)
+            try:
+                parsed = json.loads(cleaned)
+            except json.JSONDecodeError as parse_err:
+                # Try to salvage the rows that DID complete before the
+                # response got cut off, instead of throwing the whole batch
+                # away on attempt 1. Only do this if the finish_reason
+                # confirms we actually hit the token limit (so we don't
+                # mask a genuine "the model wrote bad JSON" bug as if it
+                # were a truncation).
+                finish_reason = getattr(resp.choices[0], "finish_reason", None)
+                if finish_reason == "length":
+                    try:
+                        salvaged = _repair_truncated_json_array(cleaned)
+                        print(f"Recovered {len(salvaged)} row(s) from a "
+                              f"truncated response (finish_reason=length)")
+                        parsed = salvaged
+                    except Exception:
+                        raise parse_err
+                else:
+                    raise parse_err
 
             if not isinstance(parsed, list):
                 raise ValueError("LLM did not return a JSON array")
@@ -520,6 +590,54 @@ def build_rto_lookup(rto_rows):
 
 def get_all_states(rto_to_state):
     return sorted(set(rto_to_state.values()))
+
+
+# Field names for each raw sheet's columns, by position, matching the
+# layout load_raw_sheets() reads (index 0 is always the leading blank/merge
+# column from the source workbook). Sending rows to the LLM as labeled
+# objects instead of bare positional arrays removes a major source of
+# inconsistent/incorrect extraction — the LLM no longer has to infer "is
+# index 2 the Make or the Segment on THIS sheet" from prose alone, which
+# differed between TW 1+5, TW 1+1 & SATP, and SAOD.
+SHEET_FIELD_LABELS = {
+    "TW 1+5": [
+        None, "cluster", "make", "segment", "cd1", "max_cd2", "formula_type",
+    ],
+    "TW 1+1 & SATP": [
+        None, "cluster", "segment", "cd1",
+        "max_cd2_1plus1_od", "max_cd2_satp_tp",
+    ],
+    "TW SAOD with Flexi Options": [
+        None, "cluster", "segment", "min_cd1",
+        "max_cd1_no_breakin", "max_cd1_breakin", "cd2",
+        "max_cd2_year1", "max_cd2_year2", "max_cd2_year3", "max_cd2_year4",
+    ],
+}
+
+
+def label_batch_rows(sheet_name, batch_rows):
+    """Convert raw positional rows into labeled dicts for this sheet, so the
+    LLM reads named fields (e.g. "make", "segment", "max_cd2_year3") instead
+    of having to infer column meaning from position."""
+    labels = SHEET_FIELD_LABELS.get(sheet_name)
+    if not labels:
+        return batch_rows
+    out = []
+    for row in batch_rows:
+        d = {}
+        for i, val in enumerate(row):
+            if i >= len(labels):
+                # Trailing columns beyond what we know how to label for this
+                # sheet — these are blank merge artifacts in every sheet
+                # we've seen, so drop rather than burning tokens on
+                # "col_11": null style noise.
+                continue
+            name = labels[i]
+            if name is None:
+                continue
+            d[name] = val
+        out.append(d)
+    return out
 
 
 def clusters_for_state(rto_rows_data, prod, state_name, rto_to_state):
