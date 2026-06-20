@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback } from "react";
 
-const API = "http://localhost:5050";
+const API = "https://ai-for-payout-grid.onrender.com";
 
 // ── Palette ──────────────────────────────────────────────────────────────────
 // Deep slate bg, warm amber accent, ghost-white type, muted borders
