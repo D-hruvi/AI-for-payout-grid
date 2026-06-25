@@ -32,10 +32,79 @@ OUTPUT_HEADERS = [
 ]
 
 MISP_RATE = 22.5
-FUEL_PETROL = "Petrol, LPG, Diesel, CNG"
+FUEL_PETROL = "Petrol, CNG, LPG, Diesel"   # Fixed order to match reference output
 FUEL_ALL    = "ALL"
 FUEL_EV     = "Electric"
-EXCLUDE_OTHERS = "EXCLUDE: HERO MOTOCORP, BAJAJ, HONDA, ROYAL ENFIELD, TVS, SUZUKI, YAMAHA"
+EXCLUDE_OTHERS = "EXCLUDE: BAJAJ, HERO MOTOCORP, HONDA, ROYAL ENFIELD, SUZUKI, TVS, YAMAHA"  # alphabetical
+
+# Canonical brand list used for computing EXCLUDE when "Others" appears in slash groups
+# Order matters: preserve alphabetical for EXCLUDE computations
+KNOWN_BRANDS_ORDERED = ["BAJAJ", "HERO MOTOCORP", "HONDA", "JAWA MOTORCYCLE",
+                        "ROYAL ENFIELD", "SUZUKI", "TVS", "YAMAHA"]
+KNOWN_BRANDS_SET = {b.upper() for b in KNOWN_BRANDS_ORDERED}
+
+# Full model string for the Avenger row (MC_180-350_HONDA/JAWA/Avenger)
+AVENGER_EXCLUDE_MODEL = (
+    "EXCLUDE: BAJAJ|ASPIRE, BAJAJ|BOXER, BAJAJ|BOXER 150, BAJAJ|BYK, BAJAJ|CALIBER, "
+    "BAJAJ|CT 100, BAJAJ|CUB, BAJAJ|DISCOVER, BAJAJ|DISCOVER 112, BAJAJ|DISCOVER 125, "
+    "BAJAJ|DISCOVER 135 DTSI, BAJAJ|DISCOVER 150, BAJAJ|DISCOVER F, BAJAJ|DISCOVER M, "
+    "BAJAJ|DISCOVER S, BAJAJ|DISCOVER ST, BAJAJ|DISCOVER T, BAJAJ|ELIMINATOR, "
+    "BAJAJ|KB 100, BAJAJ|KB 125 RTZ, BAJAJ|PLATINA, BAJAJ|PULSAR, BAJAJ|SONIC, "
+    "BAJAJ|SX ENDURO, BAJAJ|V15, BAJAJ|4S CHAMPION, BAJAJ|WIND 125, BAJAJ|XCD, "
+    "BAJAJ|XCD 125, BAJAJ|XCD 135, BAJAJ|XCD 135 DTSI, BAJAJ|V12, BAJAJ|DOMINAR, "
+    "BAJAJ|CT 110, BAJAJ|DISCOVER 110, BAJAJ|CT 125, LML|FREEDOM, BAJAJ|BRAVO, "
+    "BAJAJ|CHETAK, ROYAL ENFIELD|CLASSIC, BAJAJ|M 80, BAJAJ|PRIYA, BAJAJ|SAFFIRE, "
+    "BAJAJ|SPIRIT, BAJAJ|SUNNY, BAJAJ|SUPER, BAJAJ|BLADE, BAJAJ|WAVE, BAJAJ|KRISTAL, "
+    "BAJAJ|LEGEND, YAMAHA|NEO"
+)
+AVENGER_MODEL = (
+    "BAJAJ|ASPIRE, BAJAJ|BOXER, BAJAJ|BOXER 150, BAJAJ|BYK, BAJAJ|CALIBER, "
+    "BAJAJ|CT 100, BAJAJ|CUB, BAJAJ|DISCOVER, BAJAJ|DISCOVER 112, BAJAJ|DISCOVER 125, "
+    "BAJAJ|DISCOVER 135 DTSI, BAJAJ|DISCOVER 150, BAJAJ|DISCOVER F, BAJAJ|DISCOVER M, "
+    "BAJAJ|DISCOVER S, BAJAJ|DISCOVER ST, BAJAJ|DISCOVER T, BAJAJ|ELIMINATOR, "
+    "BAJAJ|KB 100, BAJAJ|KB 125 RTZ, BAJAJ|PLATINA, BAJAJ|PULSAR, BAJAJ|SONIC, "
+    "BAJAJ|SX ENDURO, BAJAJ|V15, BAJAJ|4S CHAMPION, BAJAJ|WIND 125, BAJAJ|XCD, "
+    "BAJAJ|XCD 125, BAJAJ|XCD 135, BAJAJ|XCD 135 DTSI, BAJAJ|V12, BAJAJ|DOMINAR, "
+    "BAJAJ|CT 110, BAJAJ|DISCOVER 110, BAJAJ|CT 125, LML|FREEDOM, ROYAL ENFIELD|CLASSIC, "
+    "BAJAJ|BRAVO, BAJAJ|CHETAK, BAJAJ|M 80, BAJAJ|PRIYA, BAJAJ|SAFFIRE, "
+    "BAJAJ|SPIRIT, BAJAJ|SUNNY, BAJAJ|SUPER, BAJAJ|BLADE, BAJAJ|WAVE, BAJAJ|KRISTAL, "
+    "BAJAJ|LEGEND, YAMAHA|NEO"
+)
+
+
+def normalize_make_1p5(make_raw):
+    """
+    Transform TW 1+5 Make cell → correct output string.
+
+    Rules (from reference Digit_2w.zip):
+    1. Plain 'Others'  → EXCLUDE_OTHERS (all 7 brands, alphabetical)
+    2. Slash group WITHOUT Others (e.g. 'BAJAJ/HONDA') → 'BAJAJ, HONDA' (comma-space)
+    3. Slash group WITH Others (e.g. 'TVS/SUZUKI/Others') →
+       'EXCLUDE: <brands NOT in the named list>, in KNOWN_BRANDS_ORDERED order'
+       i.e. the listed brands are the ones covered; everything else is excluded
+    """
+    raw = str(make_raw).strip()
+    parts = [p.strip() for p in raw.split("/")]
+    upper_parts = [p.upper() for p in parts]
+    has_others = any(p == "OTHERS" for p in upper_parts)
+    named_upper = [p for p in upper_parts if p != "OTHERS"]
+
+    if not has_others:
+        # Simple slash list → comma join (preserve original casing)
+        non_others = [p for p in parts if p.upper() != "OTHERS"]
+        return ", ".join(non_others)
+
+    if not named_upper:
+        # Pure 'Others' alone
+        return EXCLUDE_OTHERS
+
+    # Mixed: e.g. 'TVS/SUZUKI/Others/YAMAHA'
+    # These named brands ARE covered by this row; the EXCLUDE is the rest
+    excluded = [b for b in KNOWN_BRANDS_ORDERED
+                if b.upper() not in named_upper and b != "JAWA MOTORCYCLE"]
+    if excluded:
+        return "EXCLUDE: " + ", ".join(excluded)
+    return EXCLUDE_OTHERS
 
 RTO_STATE_NAMES = {
     "AN": "ANDAMAN ISLANDS",   "AP": "ANDHRA PRADESH",
@@ -224,10 +293,11 @@ def _rto_field(rtos):
 
 # ── TW 1+5 segment → rows ─────────────────────────────────────
 
-def seg_rows_1p5(make, seg, cd2, rule_pfx, state, rto, counter, eff_s, eff_e):
+def seg_rows_1p5(make_raw, seg, cd2, rule_pfx, state, rto, counter, eff_s, eff_e):
     rows = []
     s = str(seg).strip()
     pt, pp = resolve_payin(cd2)
+    make = normalize_make_1p5(make_raw)
 
     def add(vt, fuel, ccf=None, cct=None, pwf=None, pwt=None, use_pp=True):
         nonlocal counter
@@ -242,8 +312,8 @@ def seg_rows_1p5(make, seg, cd2, rule_pfx, state, rto, counter, eff_s, eff_e):
                               eff_s, eff_e))
         counter += 1
 
-    # BAJAJ EV 3-7KW → 3 power-band rows
-    if make == "BAJAJ" and s == "3-7 KW":
+    # BAJAJ EV 3-7KW → 3 power-band rows (check raw make for brand identity)
+    if str(make_raw).strip().upper() == "BAJAJ" and s == "3-7 KW":
         add("ALL", FUEL_EV, pwf=3.00, pwt=7.00)
         add("ALL", FUEL_EV, pwf=0.10, pwt=2.90, use_pp=False)
         add("ALL", FUEL_EV, pwf=7.10, pwt=100.00, use_pp=False)
@@ -300,24 +370,29 @@ def veh_info_1p1(seg):
     return ("ALL", FUEL_ALL, None, None)
 
 def make_field_1p1(seg):
+    """Returns (make, model) tuple for TW 1+1 rows."""
     s = str(seg).strip()
     if s == "SC/EV":
-        return "ALL"
+        return "ALL", "ALL"
     if s == "MC <= 180 Hero/Honda":
-        return "HERO MOTOCORP, HONDA"
+        return "HERO MOTOCORP, HONDA", "ALL"
     if s == "MC <= 180 Hero/Honda/TVS":
-        return "HERO MOTOCORP, HONDA, TVS"
+        return "HERO MOTOCORP, HONDA, TVS", "ALL"
     if s == "MC <= 180 Others":
-        return "EXCLUDE: HERO MOTOCORP, HONDA"
+        return "EXCLUDE: HERO MOTOCORP, HONDA", "ALL"
     if s == "MC_180-350_RE":
-        return "ROYAL ENFIELD"
+        return "ROYAL ENFIELD", "ALL"
     if s == "MC_180-350_HONDA/JAWA/Avenger":
-        return "HONDA, JAWA MOTORCYCLE, BAJAJ"
+        # Reference: make = HONDA, JAWA MOTORCYCLE, BAJAJ
+        #            model = long Avenger exclude list
+        return "HONDA, JAWA MOTORCYCLE, BAJAJ", AVENGER_EXCLUDE_MODEL
     if s in ("MC_180-350_Other than RE", "MC_180-350_Others"):
-        return "EXCLUDE: BAJAJ, HONDA, ROYAL ENFIELD, JAWA MOTORCYCLE"
+        # Reference: make = EXCLUDE: BAJAJ, HONDA, ROYAL ENFIELD, JAWA MOTORCYCLE
+        #            model = BAJAJ|AVENGER list (the Avenger models)
+        return "EXCLUDE: BAJAJ, HONDA, ROYAL ENFIELD, JAWA MOTORCYCLE", AVENGER_MODEL
     if s == "MC>350":
-        return "ALL"
-    return "ALL"
+        return "ALL", "ALL"
+    return "ALL", "ALL"
 
 # ── SAOD segment ──────────────────────────────────────────────
 
@@ -355,9 +430,8 @@ def gen_1p5(d, eff_s, eff_e, counter, state_filter=None):
         pfx = _abbr(cluster)
 
         for e in entries:
-            make = e["make"]
-            mf = EXCLUDE_OTHERS if make == "Others" else make
-            new_rows, counter = seg_rows_1p5(mf, e["seg"], e["cd2"],
+            make_raw = e["make"]
+            new_rows, counter = seg_rows_1p5(make_raw, e["seg"], e["cd2"],
                                              pfx, state, rto_f,
                                              counter, eff_s, eff_e)
             rows.extend(new_rows)
@@ -391,7 +465,7 @@ def gen_1p1(d, eff_s, eff_e, counter, state_filter=None):
         for e in entries:
             seg = e["seg"]
             vt, fuel, ccf, cct = veh_info_1p1(seg)
-            mf = make_field_1p1(seg)
+            mf, model_f = make_field_1p1(seg)
 
             if seg == "SC/EV":
                 has_ev = True
@@ -405,7 +479,7 @@ def gen_1p1(d, eff_s, eff_e, counter, state_filter=None):
             name_rr = f"{pfx}_all_RR_{counter}_TW"
             rr_rows.append(build_row(name_rr, state, rto_f,
                                      "Comprehensive", "renew, rollover", "ALL",
-                                     vt, fuel, mf, "ALL",
+                                     vt, fuel, mf, model_f,
                                      ccf, cct, None, None,
                                      pt1, pp1, eff_s, eff_e))
             counter += 1
@@ -413,7 +487,7 @@ def gen_1p1(d, eff_s, eff_e, counter, state_filter=None):
             name_tp = f"{pfx}_all_TP_{counter}_TW"
             tp_rows.append(build_row(name_tp, state, rto_f,
                                      "TP", "ALL", "ALL",
-                                     vt, fuel, mf, "ALL",
+                                     vt, fuel, mf, model_f,
                                      ccf, cct, None, None,
                                      pts, pps, eff_s, eff_e))
             counter += 1
